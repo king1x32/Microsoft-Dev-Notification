@@ -1,0 +1,218 @@
+name: Theo dõi Microsoft Dev Blog và Gửi Email
+
+on:
+  schedule:
+    # Chạy mỗi ngày lúc 9:00 AM UTC (Giờ Quốc tế Phối hợp).
+    # Bạn có thể thay đổi lịch trình theo ý muốn.
+    # Để kiểm tra cron, bạn có thể dùng https://crontab.guru/
+    - cron: "0 9 * * *"
+  workflow_dispatch: # Cho phép chạy workflow thủ công từ GitHub UI
+
+env:
+  # Thay đổi URL RSS Feed này thành URL bạn muốn theo dõi
+  RSS_FEED_URL: "https://devblogs.microsoft.com/microsoft365dev/feed/"
+  # Tệp này sẽ lưu trữ ngày/giờ của bài viết mới nhất đã được xử lý để tránh gửi trùng lặp
+  LAST_PROCESSED_FILE: "last_processed_date.txt"
+
+jobs:
+  monitor_and_send:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Cần quyền này để workflow có thể commit thay đổi vào tệp last_processed_date.txt
+
+    steps:
+      - name: Checkout code (Lấy mã nguồn về máy ảo)
+        uses: actions/checkout@v4
+
+      - name: Cài đặt công cụ cần thiết (jq, xmlstarlet)
+        # jq dùng để phân tích JSON, xmlstarlet dùng để phân tích XML (RSS)
+        # python3 cần thiết cho việc giải mã HTML entities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq xmlstarlet python3
+
+      - name: Đọc ngày xử lý cuối cùng (Đọc trạng thái lần chạy trước)
+        id: get_last_date
+        run: |
+          LAST_DATE=""
+          if [ -f "${{ env.LAST_PROCESSED_FILE }}" ]; then
+            LAST_DATE=$(cat "${{ env.LAST_PROCESSED_FILE }}")
+            echo "::notice::Ngày xử lý cuối cùng được ghi nhận: $LAST_DATE"
+          else
+            # Nếu tệp không tồn tại (lần chạy đầu tiên), đặt là 1 ngày trước để lấy các bài viết gần đây
+            LAST_DATE=$(date -u -d "1 day ago" "+%Y-%m-%dT%H:%M:%SZ")
+            echo "::notice::Tệp ngày xử lý cuối cùng không tồn tại. Đặt mặc định là 1 ngày trước: $LAST_DATE"
+          fi
+          # Lưu biến LAST_PROCESSED_DATE vào môi trường để các bước sau sử dụng
+          echo "LAST_PROCESSED_DATE=$LAST_DATE" >> $GITHUB_ENV
+
+      - name: Tải và Phân tích RSS Feed (Tìm bài viết mới)
+        id: parse_rss
+        run: |
+          RSS_CONTENT=$(curl -s "${{ env.RSS_FEED_URL }}")
+          NEW_ARTICLES_FOUND_FLAG="false"
+          NEW_LAST_PROCESSED_DATE="${{ env.LAST_PROCESSED_DATE }}"
+          EMAIL_BODY="<p>Xin chào,</p><p>Dưới đây là các bài viết mới từ blog ${{ env.RSS_FEED_URL }}:</p><br>"
+
+          XML_DATA=$(echo "$RSS_CONTENT" | xmlstarlet sel -t -m "//item" \
+            -v "title" -o "|||" \
+            -v "link" -o "|||" \
+            -v "pubDate" -o "|||" \
+            -v "description" -o "|||" \
+            -n)
+
+          while IFS='|||' read -r TITLE_ENCODED LINK PUB_DATE DESCRIPTION_ENCODED; do
+            if [ -z "$TITLE_ENCODED" ]; then
+              continue
+            fi
+
+            TITLE=$(python3 -c 'import html, sys; print(html.unescape(sys.stdin.read()))' <<< "$TITLE_ENCODED")
+            DESCRIPTION=$(python3 -c 'import html, sys; print(html.unescape(sys.stdin.read()))' <<< "$DESCRIPTION_ENCODED")
+
+            ARTICLE_DATE_ISO=$(date -u -d "$PUB_DATE" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)
+            
+            if [ -z "$ARTICLE_DATE_ISO" ]; then
+              echo "::warning::Không thể phân tích ngày: '$PUB_DATE' cho bài viết '$TITLE'. Bỏ qua bài viết này."
+              continue
+            fi
+
+            if [[ "$ARTICLE_DATE_ISO" > "$LAST_PROCESSED_DATE" ]]; then
+              echo "::notice::Tìm thấy bài viết mới: $TITLE (Ngày: $ARTICLE_DATE_ISO)"
+              NEW_ARTICLES_FOUND_FLAG="true"
+
+              if [[ "$ARTICLE_DATE_ISO" > "$NEW_LAST_PROCESSED_DATE" ]]; then
+                NEW_LAST_PROCESSED_DATE="$ARTICLE_DATE_ISO"
+              fi
+
+              EMAIL_BODY+="<b>Tiêu đề:</b> <a href=\"$LINK\">$TITLE</a><br>"
+              # *** THAY ĐỔI TẠI ĐÂY: Dùng ARTICLE_DATE_ISO thay vì PUB_DATE ***
+              EMAIL_BODY+="<b>Ngày đăng:</b> $ARTICLE_DATE_ISO<br>" 
+              EMAIL_BODY+="<br>"
+            else
+              echo "::debug::Bài viết cũ: $TITLE (Ngày: $ARTICLE_DATE_ISO). Bỏ qua."
+            fi
+          done <<< "$XML_DATA"
+
+          echo "NEW_ARTICLES_FOUND=$NEW_ARTICLES_FOUND_FLAG" >> $GITHUB_ENV
+          echo "EMAIL_BODY=$EMAIL_BODY" >> $GITHUB_ENV
+          echo "NEW_LAST_PROCESSED_DATE=$NEW_LAST_PROCESSED_DATE" >> $GITHUB_ENV
+
+      - name: Lấy Access Token từ Azure AD (Xác thực với Microsoft Graph)
+        id: get_token
+        # Bước này chỉ chạy nếu có bài viết mới hoặc nếu workflow được kích hoạt thủ công
+        if: env.NEW_ARTICLES_FOUND == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          TOKEN_RESPONSE=$(curl -s -X POST \
+            https://login.microsoftonline.com/${{ secrets.AZURE_AD_TENANT_ID }}/oauth2/v2.0/token \
+            -d 'client_id=${{ secrets.AZURE_AD_CLIENT_ID }}' \
+            -d 'scope=https://graph.microsoft.com/.default' \
+            -d 'client_secret=${{ secrets.AZURE_AD_CLIENT_SECRET }}' \
+            -d 'grant_type=client_credentials')
+
+          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+
+          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+            echo "::error::Không thể lấy Access Token. Kiểm tra Client ID, Secret, Tenant ID và quyền trong Azure AD."
+            echo "Phản hồi lỗi: $TOKEN_RESPONSE"
+            exit 1 # Thoát workflow nếu không lấy được token
+          fi
+          echo "Access Token đã lấy thành công."
+          echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV # Lưu token vào biến môi trường
+
+      - name: Gửi Email với các bài viết mới (Sử dụng Microsoft Graph API)
+        if: env.NEW_ARTICLES_FOUND == 'true' && steps.get_token.outcome == 'success'
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL_ADDRESS }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL_ADDRESS }} # Vẫn giữ nguyên tên biến này
+          EMAIL_SUBJECT: "Cập nhật Blog Microsoft Dev mới nhất"
+          EMAIL_CONTENT_RAW: |
+            ${{ env.EMAIL_BODY }}
+            <br>
+            <p>Trân trọng,</p>
+            <p>GitHub Workflow tự động</p>
+        run: |
+          if [ -z "$ACCESS_TOKEN" ]; then
+            echo "::error::Access Token không khả dụng."
+            exit 1
+          fi
+
+          # Thoát ký tự JSON cho Subject và Content
+          ESCAPED_EMAIL_SUBJECT=$(echo "$EMAIL_SUBJECT" | jq -Rsc .)
+          ESCAPED_EMAIL_CONTENT_FINAL=$(echo "${{ env.EMAIL_CONTENT_RAW }}" | jq -Rsc .)
+
+          RECICIPIENT_JSON_ARRAY=""
+          # Đặt IFS (Internal Field Separator) là dấu phẩy để tách chuỗi
+          IFS=',' read -r -a RECIPIENT_ARRAY <<< "$RECIPIENT_EMAIL"
+
+          for EMAIL_ADDR_RAW in "${RECIPIENT_ARRAY[@]}"; do
+            # Loại bỏ khoảng trắng thừa nếu có <-- CHÍNH LÀ CHỖ NÀY
+            TRIMMED_EMAIL_ADDR=$(echo "$EMAIL_ADDR_RAW" | xargs) 
+            
+            # Chỉ xử lý nếu địa chỉ không rỗng
+            if [ -n "$TRIMMED_EMAIL_ADDR" ]; then
+              # Thoát ký tự JSON cho từng địa chỉ email
+              ESCAPED_CURRENT_RECIPIENT=$(echo -n "$TRIMMED_EMAIL_ADDR" | jq -Rsc .)
+              
+              # Thêm dấu phẩy nếu đây không phải là địa chỉ đầu tiên
+              if [ -n "$RECIPIENT_JSON_ARRAY" ]; then
+                RECIPIENT_JSON_ARRAY+=","
+              fi
+              
+              # Thêm đối tượng emailAddress vào chuỗi JSON
+              RECIPIENT_JSON_ARRAY+='{"emailAddress":{"address":'$ESCAPED_CURRENT_RECIPIENT'}}'
+            fi
+          done
+
+          # Xây dựng payload JSON cho yêu cầu gửi email
+          # Bây giờ sử dụng RECIPIENT_JSON_ARRAY
+          EMAIL_PAYLOAD='{
+            "message": {
+              "subject": '"$ESCAPED_EMAIL_SUBJECT"',
+              "body": {
+                "contentType": "HTML",
+                "content": '"$ESCAPED_EMAIL_CONTENT_FINAL"'
+              },
+              "toRecipients": [
+                '"$RECIPIENT_JSON_ARRAY"'
+              ]
+            },
+            "saveToSentItems": "true"
+          }'
+
+          echo "Đang gửi email tới $RECIPIENT_EMAIL với tiêu đề: $EMAIL_SUBJECT"
+
+          SEND_MAIL_RESPONSE=$(curl -s -X POST \
+            "https://graph.microsoft.com/v1.0/users/$SENDER_EMAIL/sendMail" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$EMAIL_PAYLOAD")
+
+          if echo "$SEND_MAIL_RESPONSE" | grep -q '"error"'; then
+            echo "::error::Gửi email thất bại!"
+            echo "Phản hồi lỗi từ Graph API: $SEND_MAIL_RESPONSE"
+            exit 1
+          else
+            echo "Email đã được gửi thành công!"
+            echo "Phản hồi: $SEND_MAIL_RESPONSE"
+          fi
+
+      - name: Cập nhật ngày xử lý cuối cùng (Lưu trạng thái cho lần chạy sau)
+        # Luôn chạy bước này để cập nhật trạng thái, ngay cả khi các bước trước đó thất bại
+        # trừ khi có lỗi quá nghiêm trọng khiến các biến môi trường không được tạo
+        if: always() && env.NEW_LAST_PROCESSED_DATE != ''
+        run: |
+          echo "Đang cập nhật ngày xử lý cuối cùng thành: ${{ env.NEW_LAST_PROCESSED_DATE }}"
+          echo "${{ env.NEW_LAST_PROCESSED_DATE }}" > "${{ env.LAST_PROCESSED_FILE }}"
+
+          # Cấu hình Git để GitHub Actions Bot có thể commit
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Thêm tệp đã thay đổi vào Git
+          git add "${{ env.LAST_PROCESSED_FILE }}"
+
+          # Commit thay đổi. Sử dụng "|| true" để không báo lỗi nếu không có gì để commit
+          git commit -m "chore: Update last processed date for RSS feed" || true
+
+          # Đẩy thay đổi lên kho lưu trữ GitHub
+          git push
